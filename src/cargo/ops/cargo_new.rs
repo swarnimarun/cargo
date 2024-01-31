@@ -11,7 +11,7 @@ use serde::de;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fmt, slice};
@@ -1047,4 +1047,108 @@ fn can_be_workspace_member(
         }
     }
     Ok(true)
+}
+
+/// <!-- TODO: add actual docs here! -->
+pub fn init_workspace(path: PathBuf, config: &Config) -> CargoResult<String> {
+    let crates_list;
+    check_path(&path, &mut config.shell())?;
+
+    // if path is not a dir error out
+    if !path.is_dir() {
+        anyhow::bail!("`cargo init` can only be run on directories")
+    }
+
+    // if no root package found write out a new toml
+    // else prepend workspace members list to root package
+    let root_manifest_path = path.join("Cargo.toml");
+    let mut file = std::fs::File::open(&root_manifest_path)?;
+    let mut file_src = String::new();
+    _ = file.read_to_string(&mut file_src)?;
+    let mut root_manifest = toml_edit::Document::from_str(&file_src)?;
+    if root_manifest.contains_key("workspace") {
+        // if workspace already exists we error out!
+        anyhow::bail!(
+            "workspace already exists in directory {}",
+            path.canonicalize()?.display()
+        );
+    } else {
+        // if no workspace found in root package
+        // write out a new workspace section
+        let mut workspace = toml_edit::Table::new();
+        // find crates within path dir, this ignores packages in root
+        // build members from the detected crates list
+        let crates = detect_existing_crates(&path)?;
+        workspace["members"] =
+            toml_edit::value(build_workspace_members(&path.canonicalize()?, crates)?);
+        root_manifest["workspace"] = toml_edit::Item::Table(workspace);
+        std::fs::write(root_manifest_path, root_manifest.to_string())?;
+        crates_list = root_manifest["workspace"]
+            .as_table()
+            .and_then(|tab| tab.get("members"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                let mut v: Vec<String> = arr
+                    .iter()
+                    .map(|v| format!("\"{}\"", v.as_str().unwrap_or("")))
+                    .collect();
+                if v.len() > 3 {
+                    v.drain(3..);
+                    v.push("...".to_string());
+                }
+                v.join(", ")
+            })
+            .unwrap_or_default();
+    }
+
+    Ok(crates_list)
+}
+
+fn detect_existing_crates(path: &Path) -> CargoResult<impl Iterator<Item = PathBuf>> {
+    Ok(walkdir::WalkDir::new(path)
+        .min_depth(2)
+        .max_depth(6)
+        .same_file_system(true)
+        .into_iter()
+        .filter_entry(|s| {
+            s.path().is_dir()
+                && s.file_name()
+                    .to_str()
+                    .map(|s| !s.starts_with('.'))
+                    .unwrap_or(true)
+        })
+        .flatten()
+        .filter_map(|f| {
+            if f.path().join("Cargo.toml").exists() {
+                f.path().canonicalize().ok()
+            } else {
+                None
+            }
+        }))
+}
+
+fn build_workspace_members(
+    root_path: &Path,
+    crates: impl Iterator<Item = PathBuf>,
+) -> CargoResult<toml_edit::Array> {
+    let mut members = toml_edit::Array::default();
+    for crate_path in crates {
+        if !crate_path.is_dir() {
+            anyhow::bail!("Path {} is not a directory", crate_path.display());
+        }
+        let mut path = crate_path;
+        // strip root_path from crate_path
+        if let Ok(p) = path.strip_prefix(root_path) {
+            path = p.to_path_buf();
+        } else {
+            anyhow::bail!(
+                "Path {} is not a child of {}",
+                path.display(),
+                root_path.display()
+            );
+        }
+        // TODO: remove unwrap
+        members.push(path.to_str().unwrap());
+    }
+    Ok(members)
 }
